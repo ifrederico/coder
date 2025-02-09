@@ -1,0 +1,12 @@
+[
+    {
+        "requirement": "Write a function to reverse a string",
+        "solution": "def reverse_string(s: str) -> str:\n    return s[::-1]",
+        "is_correct": true
+    },
+    {
+        "requirement": "Write a function to reverse a string",
+        "solution": "def reverse_string(s):\n    pass",
+        "is_correct": false
+    }
+]

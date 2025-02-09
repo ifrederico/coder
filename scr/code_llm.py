@@ -1,135 +1,133 @@
-import os
+# src/code_llm.py
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from typing import Optional
 import asyncio
-import aiohttp
-import backoff
-from typing import Optional, Dict, Any, List
-from tenacity import retry, stop_after_attempt, wait_exponential
+import gc
 
 class CodeLLM:
-    """Enhanced wrapper for LLM code generation with async support and error handling"""
+    """Local LLM wrapper using HuggingFace models"""
     
     def __init__(
         self,
-        model_name: str = "gpt-4-turbo-preview",
-        api_key: Optional[str] = None,
-        api_base: str = "https://api.openai.com/v1",
-        max_retries: int = 3,
-        timeout: int = 30,
+        model_name: str = "microsoft/phi-1_5",  # More memory efficient model
+        device: str = "cpu",  # Use CPU for stability
+        max_length: int = 2048
     ):
-        """
-        Initialize the CodeLLM wrapper.
+        """Initialize local LLM."""
+        self.device = device
+        self.max_length = max_length
         
-        Args:
-            model_name: Name of the model to use
-            api_key: OpenAI API key (defaults to env var)
-            api_base: Base URL for API
-            max_retries: Maximum number of retries for failed requests
-            timeout: Timeout in seconds for API calls
-        """
-        self.model_name = model_name
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("No API key provided and OPENAI_API_KEY env var not set")
+        print(f"Loading model {model_name} on {device}...")
         
-        self.api_base = api_base
-        self.max_retries = max_retries
-        self.timeout = timeout
-        self._session = None
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_fast=True
+        )
+        
+        # Load model with memory optimizations
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            offload_folder="model_cache"  # Cache large tensors to disk
+        ).to(device)
+        
+        # Make sure we have a padding token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # System prompt for code generation
-        self.system_prompt = """You are an expert Python programmer. 
-        Generate clean, efficient, and well-structured code that meets the given requirements.
-        Return only the code without any explanations or comments unless specifically requested."""
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session"""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            )
-        return self._session
-    
-    @backoff.on_exception(
-        backoff.expo,
-        (aiohttp.ClientError, asyncio.TimeoutError),
-        max_tries=3
-    )
-    async def _make_request(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: int = 500,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """Make API request with retries and error handling"""
-        session = await self._get_session()
+        self.system_prompt = """Write Python code for the following task.
+        Return only the code without any explanations.
+        The code should be clean, efficient, and well-structured.
         
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            **kwargs
-        }
-        
-        async with session.post(f"{self.api_base}/chat/completions", json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise ValueError(f"API request failed: {error_text}")
-            return await response.json()
-
+        Task description:
+        """
+    
     async def generate_code_async(
         self,
         prompt: str,
         temperature: float = 0.7,
-        max_tokens: int = 500,
+        max_tokens: Optional[int] = None,
         **kwargs
     ) -> str:
-        """
-        Asynchronously generate code using the LLM.
-        
-        Args:
-            prompt: The coding task description
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum tokens in the response
-            **kwargs: Additional parameters for the API call
-            
-        Returns:
-            str: Generated code
-        """
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt}
-        ]
-        
+        """Asynchronously generate code using the local model."""
         try:
-            response = await self._make_request(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            # Clear CUDA cache if using GPU
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Combine system prompt and user prompt
+            full_prompt = f"{self.system_prompt}\n{prompt}\n\nCode:\n"
+            
+            # Tokenize input
+            inputs = self.tokenizer(
+                full_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length // 2,
+                padding=True
+            ).to(self.device)
+            
+            # Set up generation parameters
+            gen_kwargs = {
+                "max_length": max_tokens or self.max_length,
+                "temperature": temperature,
+                "do_sample": True,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "num_return_sequences": 1,
+                "top_p": 0.95,
+                "top_k": 50,
                 **kwargs
+            }
+            
+            # Run generation in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            tokens = await loop.run_in_executor(
+                None,
+                lambda: self.model.generate(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    **gen_kwargs
+                )
             )
-            return response['choices'][0]['message']['content'].strip()
+            
+            # Decode and clean up response
+            generated_code = self.tokenizer.decode(tokens[0], skip_special_tokens=True)
+            
+            # Extract only the code part after our prompt
+            code_part = generated_code[len(full_prompt):].strip()
+            
+            # Clean up any remaining prompt artifacts
+            if code_part.startswith("python") or code_part.startswith("Python"):
+                code_part = code_part[code_part.find("\n")+1:]
+            
+            # Force garbage collection again
+            del tokens, inputs
+            gc.collect()
+            
+            return code_part.strip()
+            
         except Exception as e:
-            print(f"Error generating code: {str(e)}")
-            raise
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
+            print(f"Error during code generation: {str(e)}")
+            return f"# Error during generation: {str(e)}"
+    
     def generate_code(
         self,
         prompt: str,
         temperature: float = 0.7,
-        max_tokens: int = 500,
+        max_tokens: Optional[int] = None,
         **kwargs
     ) -> str:
-        """
-        Synchronous version of generate_code_async for compatibility.
-        Uses asyncio.run() internally.
-        """
+        """Synchronous version of generate_code_async"""
         return asyncio.run(
             self.generate_code_async(
                 prompt,
@@ -140,23 +138,11 @@ class CodeLLM:
         )
 
     async def __aenter__(self):
-        """Async context manager entry"""
-        await self._get_session()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-# Example usage
-if __name__ == "__main__":
-    async def main():
-        llm = CodeLLM()
-        prompt = "Write a Python function that implements binary search"
-        
-        async with llm:
-            code = await llm.generate_code_async(prompt)
-            print(code)
-    
-    asyncio.run(main())
+        # Clean up resources
+        del self.model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
