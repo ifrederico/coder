@@ -1,5 +1,26 @@
-A minimal set; adjust to your needs:
+# Core Deep Learning - CPU versions
+torch==2.0.0+cpu
+torchvision==0.15.0+cpu
+torchaudio==2.0.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-openai>=0.27.0 torch>=2.0.0 pytest>=7.0.0
+# Model and Embeddings
+transformers>=4.36.0
+sentence-transformers>=2.2.2
+accelerate>=0.25.0  # For efficient model loading
+bitsandbytes>=0.41.1  # For model quantization
 
-*(Add `transformers`, etc. if needed for local embeddings or advanced LLM usage.)*
+# Testing & Development
+pytest>=7.0.0
+black>=23.12.0
+flake8>=6.1.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.66.1
+pyyaml>=6.0.1
+loguru>=0.7.2
+
+# Visualization
+matplotlib>=3.8.0
+plotly>=5.18.0
